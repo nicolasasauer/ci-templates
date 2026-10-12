@@ -1,0 +1,144 @@
+name: Windows Release (wiederverwendbar)
+
+# Stufe 3c: Windows-Build als ZIP und, wenn gewünscht, als MSIX für den
+# Microsoft Store. Das MSIX ist absichtlich unsigniert, der Store signiert es.
+# Es dient nur zum Hochladen, nicht zum Installieren.
+#
+# Windows-Läufe zählen auf privaten Repos doppelt gegen das Minutenkontingent.
+# Deshalb nur von Hand oder per Tag starten, nie bei jedem Merge.
+#
+# Die App braucht für das MSIX den Eintrag `msix_config` in der pubspec.yaml
+# (Identität aus dem Partner Center, `build_windows: false`).
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        description: Dateiname ohne Endung (zum Beispiel focus-flow)
+        type: string
+        required: true
+      working-directory:
+        type: string
+        default: .
+      flutter-version:
+        type: string
+        default: 3.44.0
+      run-tests:
+        type: boolean
+        default: false
+      build-msix:
+        description: Store-Paket mit bauen
+        type: boolean
+        default: true
+      msix-version-prefix:
+        description: Die ersten zwei Stellen der Store-Version. Es entsteht <Präfix>.<Commit-Anzahl>.0.
+        type: string
+        default: '1.0'
+      build-args:
+        description: Zusätzliche Argumente für flutter build windows
+        type: string
+        default: ''
+      github-release-tag:
+        description: Tag, an dem ein GitHub-Release hängt. Leer lässt nur das Artefakt entstehen.
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Windows bauen
+    runs-on: windows-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Versionsnummer bestimmen
+        run: echo "BUILD_NUMBER=$(git rev-list --count HEAD)" >> "$GITHUB_ENV"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ inputs.flutter-version }}
+          channel: stable
+          cache: true
+
+      - name: Abhängigkeiten
+        run: flutter pub get
+
+      - name: Tests
+        if: inputs.run-tests
+        run: flutter test
+
+      - name: Windows-Version bauen
+        env:
+          BUILD_ARGS: ${{ inputs.build-args }}
+        run: |
+          # shellcheck disable=SC2086
+          flutter build windows --release --build-number="$BUILD_NUMBER" $BUILD_ARGS
+
+      # Die .exe läuft nur mit den DLLs und dem data-Ordner daneben.
+      - name: ZIP packen
+        shell: pwsh
+        env:
+          APP_NAME: ${{ inputs.app-name }}
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item -Recurse build\windows\x64\runner\Release $env:APP_NAME
+          Compress-Archive -Path $env:APP_NAME -DestinationPath "dist\$($env:APP_NAME)-windows-x64.zip"
+          Get-ChildItem dist
+
+      # Store-Versionen sind a.b.c.d mit letzter Stelle 0. Die Commit-Anzahl an
+      # dritter Stelle lässt sie mit jedem Merge steigen.
+      - name: Store-Paket bauen
+        if: inputs.build-msix
+        env:
+          APP_NAME: ${{ inputs.app-name }}
+          VERSION_PREFIX: ${{ inputs.msix-version-prefix }}
+        run: |
+          dart run msix:create \
+            --version "$VERSION_PREFIX.$BUILD_NUMBER.0" \
+            --output-path dist --output-name "$APP_NAME-store"
+          ls -lh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.app-name }}-windows-release
+          path: ${{ inputs.working-directory }}/dist/*
+          if-no-files-found: error
+
+  publish:
+    name: GitHub-Release ergänzen
+    needs: build
+    if: inputs.github-release-tag != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.github-release-tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.app-name }}-windows-release
+          path: dist
+
+      - name: Release anlegen, falls es fehlt
+        run: |
+          if ! gh release view "$TAG" > /dev/null 2>&1; then
+            gh release create "$TAG" --generate-notes --title "$TAG" \
+              || gh release view "$TAG" > /dev/null
+          fi
+
+      - name: Dateien hochladen
+        run: gh release upload "$TAG" dist/* --clobber

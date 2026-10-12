@@ -1,0 +1,252 @@
+name: Android Test-APK (wiederverwendbar)
+
+# Stufe 3a: baut ein signiertes APK nur für arm64 (jedes aktuelle Handy, etwa
+# 20 MB statt 56 MB) und legt es als Artefakt ab. Mit `publish: true` liegt es
+# zusätzlich auf dem beweglichen Pre-Release "latest", damit die neueste
+# Version immer am selben Ort steht. Die aufrufende App veröffentlicht nur auf
+# main und gibt dem Job dafür `permissions: contents: write`.
+#
+# Das APK ist mit dem Upload-Schlüssel signiert und lässt sich deshalb über die
+# installierte Version legen. Fehlt der Schlüssel oder passt das Passwort nicht,
+# bricht der Build nicht ab: er signiert mit dem Debug-Schlüssel und warnt.
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        description: Dateiname des APK ohne Endung (zum Beispiel focus-flow)
+        type: string
+        required: true
+      working-directory:
+        type: string
+        default: .
+      flutter-version:
+        type: string
+        default: 3.44.0
+      java-version:
+        type: string
+        default: '17'
+      apt-packages:
+        type: string
+        default: ''
+      pre-build-command:
+        type: string
+        default: ''
+      gradle-jvmargs:
+        type: string
+        default: -Xmx3G -XX:MaxMetaspaceSize=1G -XX:ReservedCodeCacheSize=512m -XX:+HeapDumpOnOutOfMemoryError
+      build-args:
+        description: Zusätzliche Argumente für flutter build apk (zum Beispiel --dart-define=NAME=wert)
+        type: string
+        default: ''
+      run-tests:
+        description: flutter test vor dem Build. Die CI hat sie meist schon geprüft.
+        type: boolean
+        default: false
+      publish:
+        description: Auf dem Pre-Release veröffentlichen
+        type: boolean
+        default: false
+      release-tag:
+        description: Tag des beweglichen Pre-Releases
+        type: string
+        default: latest
+    secrets:
+      KEYSTORE_BASE64:
+        required: false
+      KEYSTORE_PASSWORD:
+        required: false
+      KEY_ALIAS:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Test-APK bauen
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      build-number: ${{ steps.version.outputs.build-number }}
+      signed: ${{ steps.signing.outputs.signed }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # versionCode = Anzahl der Commits im Branch. Sie steigt mit jedem Merge
+      # und ist für das "latest"-APK und ein Play-Release desselben Commits
+      # gleich. Android verweigert ein Update mit kleinerem Code, Play jeden
+      # schon gesehenen. Dafür braucht es die volle Historie.
+      - name: Versionsnummer bestimmen
+        id: version
+        run: |
+          count=$(git rev-list --count HEAD)
+          echo "BUILD_NUMBER=$count" >> "$GITHUB_ENV"
+          echo "build-number=$count" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ inputs.flutter-version }}
+          channel: stable
+          cache: true
+
+      - name: Linux-Pakete bereitstellen
+        if: inputs.apt-packages != ''
+        env:
+          APT_PACKAGES: ${{ inputs.apt-packages }}
+        run: |
+          sudo apt-get update
+          # shellcheck disable=SC2086
+          sudo apt-get install -y $APT_PACKAGES
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle', '**/*.gradle.kts', '**/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Gradle einstellen
+        env:
+          GRADLE_JVMARGS: ${{ inputs.gradle-jvmargs }}
+        run: |
+          mkdir -p ~/.gradle
+          {
+            echo "org.gradle.vfs.watch=false"
+            echo "org.gradle.jvmargs=$GRADLE_JVMARGS"
+          } >> ~/.gradle/gradle.properties
+
+      - name: Abhängigkeiten
+        run: flutter pub get
+
+      - name: Vorbereitung
+        if: inputs.pre-build-command != ''
+        env:
+          PRE_BUILD_COMMAND: ${{ inputs.pre-build-command }}
+        run: bash -c "$PRE_BUILD_COMMAND"
+
+      - name: Tests
+        if: inputs.run-tests
+        run: flutter test
+
+      # Zwei Konventionen in den Apps: Umgebungsvariablen (ANDROID_KEYSTORE_*)
+      # und android/key.properties. Beide werden bedient, damit keine App ihr
+      # Gradle-Skript ändern muss.
+      - name: Signaturschlüssel bereitstellen
+        id: signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          echo "signed=false" >> "$GITHUB_OUTPUT"
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::warning::Secret KEYSTORE_BASE64 fehlt. Das APK wird mit dem Debug-Schlüssel signiert und lässt sich nicht über die installierte App legen."
+            exit 0
+          fi
+          keystore="$RUNNER_TEMP/release.keystore"
+          printf '%s' "$KEYSTORE_BASE64" | tr -d ' \n\r' | base64 --decode > "$keystore"
+          if ! keytool -list -keystore "$keystore" -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" > /dev/null 2>&1; then
+            echo "::warning::Schlüssel, Passwort oder Alias passen nicht zusammen. Das APK wird mit dem Debug-Schlüssel signiert."
+            exit 0
+          fi
+          {
+            echo "ANDROID_KEYSTORE_PATH=$keystore"
+            echo "ANDROID_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD"
+            echo "ANDROID_KEY_ALIAS=$KEY_ALIAS"
+            echo "ANDROID_KEY_PASSWORD=$KEYSTORE_PASSWORD"
+          } >> "$GITHUB_ENV"
+          cat > android/key.properties <<PROPS
+          storeFile=$keystore
+          storePassword=$KEYSTORE_PASSWORD
+          keyAlias=$KEY_ALIAS
+          keyPassword=$KEYSTORE_PASSWORD
+          PROPS
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+
+      - name: APK bauen (arm64)
+        env:
+          BUILD_ARGS: ${{ inputs.build-args }}
+        run: |
+          # shellcheck disable=SC2086
+          flutter build apk --release --split-per-abi --target-platform android-arm64 \
+            --build-number="$BUILD_NUMBER" $BUILD_ARGS
+
+      - name: APK benennen
+        env:
+          APP_NAME: ${{ inputs.app-name }}
+        run: |
+          mkdir -p dist
+          cp build/app/outputs/flutter-apk/app-arm64-v8a-release.apk "dist/$APP_NAME.apk"
+          ls -lh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.app-name }}-test-apk
+          path: ${{ inputs.working-directory }}/dist/${{ inputs.app-name }}.apk
+          if-no-files-found: error
+
+  publish:
+    name: Auf "${{ inputs.release-tag }}" veröffentlichen
+    needs: build
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.release-tag }}
+      APP_NAME: ${{ inputs.app-name }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.app-name }}-test-apk
+          path: dist
+
+      - name: Pre-Release anlegen, falls es fehlt
+        run: |
+          if ! gh release view "$TAG" > /dev/null 2>&1; then
+            gh release create "$TAG" --prerelease --latest=false \
+              --title "Neuester Build" --notes "wird gleich ersetzt" --target "$GITHUB_SHA"
+          fi
+
+      # Ein Tag bleibt sonst auf dem ersten Commit stehen.
+      - name: Tag verschieben
+        run: |
+          git tag -f "$TAG" "$GITHUB_SHA"
+          git push -f origin "refs/tags/$TAG"
+
+      - name: APK hochladen und Beschreibung setzen
+        env:
+          BUILD_NUMBER: ${{ needs.build.outputs.build-number }}
+          SIGNED: ${{ needs.build.outputs.signed }}
+        run: |
+          if [ "$SIGNED" = "true" ]; then
+            signatur="Upload-Schlüssel (lässt sich über die installierte App legen)"
+          else
+            signatur="Debug-Schlüssel (vorher die installierte App deinstallieren)"
+          fi
+          {
+            echo "Automatisch gebaut aus $GITHUB_SHA (Lauf $GITHUB_RUN_NUMBER, versionCode $BUILD_NUMBER)."
+            echo
+            echo "| Datei | Plattform | Signatur |"
+            echo "| --- | --- | --- |"
+            echo "| \`$APP_NAME.apk\` | Android arm64 (aktuelle Handys) | $signatur |"
+          } > notes.md
+          gh release upload "$TAG" "dist/$APP_NAME.apk" --clobber
+          gh release edit "$TAG" --notes-file notes.md --prerelease --latest=false

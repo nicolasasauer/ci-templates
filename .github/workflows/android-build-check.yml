@@ -1,0 +1,108 @@
+name: Android Build-Check (wiederverwendbar)
+
+# Stufe 2: baut ein unsigniertes Release-APK für arm64, ohne es zu veröffentlichen.
+# Findet Fehler, die Analyse und Tests nicht sehen: Gradle, Abhängigkeiten,
+# compileSdk, Kotlin-JVM-Ziel und R8. Die aufrufende App startet ihn nur bei
+# Änderungen an pubspec.yaml, android/** oder den Workflows und einmal pro Woche.
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        type: string
+        default: .
+      flutter-version:
+        type: string
+        default: 3.44.0
+      java-version:
+        type: string
+        default: '17'
+      apt-packages:
+        type: string
+        default: ''
+      pre-build-command:
+        description: Befehl vor dem Build (zum Beispiel dart run build_runner build)
+        type: string
+        default: ''
+      gradle-jvmargs:
+        description: Heap für den Gradle-Daemon. Zu viel lässt den Runner volllaufen.
+        type: string
+        default: -Xmx3G -XX:MaxMetaspaceSize=1G -XX:ReservedCodeCacheSize=512m -XX:+HeapDumpOnOutOfMemoryError
+      build-args:
+        description: Zusätzliche Argumente für flutter build apk (zum Beispiel --dart-define=NAME=wert)
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  build-check:
+    name: Android-Build prüfen
+    runs-on: ubuntu-latest
+    # Ein normaler Lauf dauert 8 bis 12 Minuten. Lieber früh scheitern als hängen.
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ inputs.flutter-version }}
+          channel: stable
+          cache: true
+
+      - name: Linux-Pakete bereitstellen
+        if: inputs.apt-packages != ''
+        env:
+          APT_PACKAGES: ${{ inputs.apt-packages }}
+        run: |
+          sudo apt-get update
+          # shellcheck disable=SC2086
+          sudo apt-get install -y $APT_PACKAGES
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle', '**/*.gradle.kts', '**/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      # Der Datei-Beobachter von Gradle hängt sich auf, wenn im selben Checkout
+      # ein zweiter Build startet ("Already watching path"). Die Datei im
+      # Benutzerordner hat Vorrang vor der gradle.properties der App.
+      - name: Gradle einstellen
+        env:
+          GRADLE_JVMARGS: ${{ inputs.gradle-jvmargs }}
+        run: |
+          mkdir -p ~/.gradle
+          {
+            echo "org.gradle.vfs.watch=false"
+            echo "org.gradle.jvmargs=$GRADLE_JVMARGS"
+          } >> ~/.gradle/gradle.properties
+
+      - name: Abhängigkeiten
+        run: flutter pub get
+
+      - name: Vorbereitung
+        if: inputs.pre-build-command != ''
+        env:
+          PRE_BUILD_COMMAND: ${{ inputs.pre-build-command }}
+        run: bash -c "$PRE_BUILD_COMMAND"
+
+      # Ein ABI genügt: arm64 ist jedes aktuelle Handy. Release statt Debug,
+      # weil R8 und die Minimierung nur dort laufen.
+      - name: Release-APK bauen (arm64, unsigniert)
+        env:
+          BUILD_ARGS: ${{ inputs.build-args }}
+        run: |
+          # shellcheck disable=SC2086
+          flutter build apk --release --target-platform android-arm64 $BUILD_ARGS

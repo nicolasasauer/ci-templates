@@ -1,0 +1,19 @@
+# Stufe 1: bei jedem Push und Pull Request. In der App als .github/workflows/ci.yml ablegen.
+# Der Job-Name für den Pflicht-Check im Branch-Schutz lautet "ci / Analyse und Tests".
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    uses: nicolasasauer/ci-templates/.github/workflows/flutter-ci.yml@main
+    with:
+      apt-packages: libsqlite3-dev   # nur nötig, wenn die Tests SQLite über FFI nutzen

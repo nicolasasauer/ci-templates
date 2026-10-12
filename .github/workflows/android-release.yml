@@ -1,0 +1,240 @@
+name: Android Release (wiederverwendbar)
+
+# Stufe 3b: App Bundle für Google Play plus APK, beides signiert. Die Tests
+# laufen vorher, denn ein Release, das die eigenen Tests nicht besteht, soll
+# nicht entstehen. Fehlt der Signaturschlüssel, bricht der Lauf ab, statt ein
+# APK zu erzeugen, das sich nicht über die installierte App legen lässt.
+#
+# Von Hand gestartet entsteht nur ein Artefakt. Mit `github-release-tag` (die
+# aufrufende App übergibt bei einem `v*`-Tag den Tag-Namen) wird zusätzlich ein
+# GitHub-Release angelegt. Dafür braucht der Job `permissions: contents: write`.
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        description: Dateiname ohne Endung (zum Beispiel focus-flow)
+        type: string
+        required: true
+      working-directory:
+        type: string
+        default: .
+      flutter-version:
+        type: string
+        default: 3.44.0
+      java-version:
+        type: string
+        default: '17'
+      apt-packages:
+        type: string
+        default: ''
+      pre-build-command:
+        type: string
+        default: ''
+      gradle-jvmargs:
+        type: string
+        default: -Xmx3G -XX:MaxMetaspaceSize=1G -XX:ReservedCodeCacheSize=512m -XX:+HeapDumpOnOutOfMemoryError
+      build-args:
+        description: Zusätzliche Argumente für flutter build (zum Beispiel --dart-define=NAME=wert)
+        type: string
+        default: ''
+      all-abis:
+        description: Auch armeabi-v7a und x86_64 bauen. Meist unnötig, arm64 genügt.
+        type: boolean
+        default: false
+      github-release-tag:
+        description: Tag, an dem ein GitHub-Release hängt. Leer lässt nur das Artefakt entstehen.
+        type: string
+        default: ''
+    secrets:
+      KEYSTORE_BASE64:
+        required: false
+      KEYSTORE_PASSWORD:
+        required: false
+      KEY_ALIAS:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: App Bundle und APK bauen
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Siehe android-test-apk.yml: gleiche Nummer für "latest" und Release.
+      - name: Versionsnummer bestimmen
+        id: version
+        env:
+          RELEASE_TAG: ${{ inputs.github-release-tag }}
+        run: |
+          count=$(git rev-list --count HEAD)
+          echo "BUILD_NUMBER=$count" >> "$GITHUB_ENV"
+          if [ -n "$RELEASE_TAG" ]; then
+            echo "version=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=dev-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ inputs.flutter-version }}
+          channel: stable
+          cache: true
+
+      - name: Linux-Pakete bereitstellen
+        if: inputs.apt-packages != ''
+        env:
+          APT_PACKAGES: ${{ inputs.apt-packages }}
+        run: |
+          sudo apt-get update
+          # shellcheck disable=SC2086
+          sudo apt-get install -y $APT_PACKAGES
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle', '**/*.gradle.kts', '**/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Gradle einstellen
+        env:
+          GRADLE_JVMARGS: ${{ inputs.gradle-jvmargs }}
+        run: |
+          mkdir -p ~/.gradle
+          {
+            echo "org.gradle.vfs.watch=false"
+            echo "org.gradle.jvmargs=$GRADLE_JVMARGS"
+          } >> ~/.gradle/gradle.properties
+
+      - name: Abhängigkeiten
+        run: flutter pub get
+
+      - name: Vorbereitung
+        if: inputs.pre-build-command != ''
+        env:
+          PRE_BUILD_COMMAND: ${{ inputs.pre-build-command }}
+        run: bash -c "$PRE_BUILD_COMMAND"
+
+      - name: Tests
+        run: flutter test
+
+      - name: Signaturschlüssel bereitstellen
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ] || [ -z "$KEYSTORE_PASSWORD" ] || [ -z "$KEY_ALIAS" ]; then
+            echo "::error::KEYSTORE_BASE64, KEYSTORE_PASSWORD und KEY_ALIAS müssen als Secrets gesetzt sein. Ein Release ohne den Upload-Schlüssel ist unbrauchbar."
+            exit 1
+          fi
+          keystore="$RUNNER_TEMP/release.keystore"
+          printf '%s' "$KEYSTORE_BASE64" | tr -d ' \n\r' | base64 --decode > "$keystore"
+          if ! keytool -list -keystore "$keystore" -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" > /dev/null 2>&1; then
+            echo "::error::Schlüssel, Passwort oder Alias passen nicht zusammen."
+            exit 1
+          fi
+          {
+            echo "ANDROID_KEYSTORE_PATH=$keystore"
+            echo "ANDROID_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD"
+            echo "ANDROID_KEY_ALIAS=$KEY_ALIAS"
+            echo "ANDROID_KEY_PASSWORD=$KEYSTORE_PASSWORD"
+          } >> "$GITHUB_ENV"
+          cat > android/key.properties <<PROPS
+          storeFile=$keystore
+          storePassword=$KEYSTORE_PASSWORD
+          keyAlias=$KEY_ALIAS
+          keyPassword=$KEYSTORE_PASSWORD
+          PROPS
+
+      - name: APK bauen
+        env:
+          BUILD_ARGS: ${{ inputs.build-args }}
+          ALL_ABIS: ${{ inputs.all-abis }}
+        run: |
+          if [ "$ALL_ABIS" = "true" ]; then
+            platforms="android-arm,android-arm64,android-x64"
+          else
+            platforms="android-arm64"
+          fi
+          # shellcheck disable=SC2086
+          flutter build apk --release --split-per-abi --target-platform "$platforms" \
+            --build-number="$BUILD_NUMBER" $BUILD_ARGS
+
+      # Play nimmt nur App Bundles an. Die APKs sind zum Direktinstallieren.
+      - name: App Bundle bauen
+        env:
+          BUILD_ARGS: ${{ inputs.build-args }}
+        run: |
+          # shellcheck disable=SC2086
+          flutter build appbundle --release --build-number="$BUILD_NUMBER" $BUILD_ARGS
+
+      - name: Dateien benennen
+        env:
+          APP_NAME: ${{ inputs.app-name }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p dist
+          for apk in build/app/outputs/flutter-apk/app-*-release.apk; do
+            abi="${apk##*/app-}"
+            abi="${abi%-release.apk}"
+            cp "$apk" "dist/$APP_NAME-$VERSION-$abi.apk"
+          done
+          cp build/app/outputs/bundle/release/app-release.aab "dist/$APP_NAME-$VERSION.aab"
+          ls -lh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.app-name }}-android-release
+          path: ${{ inputs.working-directory }}/dist/*
+          if-no-files-found: error
+
+  publish:
+    name: GitHub-Release anlegen
+    needs: build
+    if: inputs.github-release-tag != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.github-release-tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.app-name }}-android-release
+          path: dist
+
+      # Android- und Windows-Release können gleichzeitig zum selben Tag laufen.
+      # Wer zuerst kommt, legt das Release an, der andere lädt nur hoch.
+      - name: Release anlegen, falls es fehlt
+        run: |
+          if ! gh release view "$TAG" > /dev/null 2>&1; then
+            gh release create "$TAG" --generate-notes --title "$TAG" \
+              || gh release view "$TAG" > /dev/null
+          fi
+
+      - name: Dateien hochladen
+        run: gh release upload "$TAG" dist/* --clobber

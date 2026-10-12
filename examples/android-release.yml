@@ -1,0 +1,19 @@
+# Stufe 3b: App Bundle für Play plus APK. Von Hand gestartet entsteht ein Artefakt,
+# bei einem Tag v* zusätzlich ein GitHub-Release.
+# In der App als .github/workflows/android-release.yml ablegen.
+name: Android-Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  release:
+    permissions:
+      contents: write
+    uses: nicolasasauer/ci-templates/.github/workflows/android-release.yml@main
+    with:
+      app-name: meine-app
+      github-release-tag: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+    secrets: inherit

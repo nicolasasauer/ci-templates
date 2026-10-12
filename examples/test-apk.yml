@@ -1,0 +1,23 @@
+# Stufe 3a: Test-APK (arm64) bei jedem Merge auf main als Pre-Release "latest",
+# auf Knopfdruck auch aus jedem anderen Branch (dann nur als Artefakt).
+# In der App als .github/workflows/test-apk.yml ablegen.
+name: Test-APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: test-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    permissions:
+      contents: write
+    uses: nicolasasauer/ci-templates/.github/workflows/android-test-apk.yml@main
+    with:
+      app-name: meine-app
+      publish: ${{ github.ref == 'refs/heads/main' }}
+    secrets: inherit

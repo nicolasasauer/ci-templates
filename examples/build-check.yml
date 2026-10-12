@@ -1,0 +1,29 @@
+# Stufe 2: Android-Build nur prüfen, wenn sich Abhängigkeiten oder Android ändern,
+# dazu einmal pro Woche. In der App als .github/workflows/build-check.yml ablegen.
+name: Build-Check
+
+on:
+  pull_request:
+    paths:
+      - pubspec.yaml
+      - pubspec.lock
+      - android/**
+      - .github/workflows/**
+  push:
+    branches: [main]
+    paths:
+      - pubspec.yaml
+      - pubspec.lock
+      - android/**
+      - .github/workflows/**
+  schedule:
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: build-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-check:
+    uses: nicolasasauer/ci-templates/.github/workflows/android-build-check.yml@main

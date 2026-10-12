@@ -1,0 +1,17 @@
+# Stufe 3c: Windows-ZIP und Store-MSIX. Nur von Hand oder per Tag, nie bei jedem Merge.
+# In der App als .github/workflows/windows-release.yml ablegen.
+name: Windows-Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  release:
+    permissions:
+      contents: write
+    uses: nicolasasauer/ci-templates/.github/workflows/windows-release.yml@main
+    with:
+      app-name: meine-app
+      github-release-tag: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
